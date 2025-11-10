@@ -10,6 +10,7 @@ import scipy.special
 import torchvision.transforms as transforms
 from PIL import Image
 from collections import deque
+import time
 import sys
 import os
 
@@ -27,6 +28,7 @@ LOOK_Y_OFFSET = 60
 EMA_ALPHA = 0.30
 MISS_WINDOW = 20
 MISS_THRESH = 2
+LANE_MEMORY_DURATION = 2.0  # seconds - use last good lane for this long
 
 
 class LaneDetector:
@@ -43,6 +45,8 @@ class LaneDetector:
         self.last_coeff_left = None
         self.last_coeff_right = None
         self.lane_center_history = deque(maxlen=3)
+        self.last_good_detection_time = 0.0
+        self.lane_lost_start_time = 0.0
         
         print("✓ Lane Detector initialized")
     
@@ -213,13 +217,96 @@ class LaneDetector:
         lanes_ok = (coeff_left is not None) or (coeff_right is not None)
         self.lanes_ok_window.append(1 if lanes_ok else 0)
         
+        # Update last good detection time
+        if lanes_ok:
+            self.last_good_detection_time = time.time()
+            self.lane_lost_start_time = 0.0
+        elif self.lane_lost_start_time == 0.0 and not lanes_ok:
+            self.lane_lost_start_time = time.time()
+        
         return self.err_ema
     
     def is_lane_lost(self):
-        """Check if lanes are lost"""
+        """Check if lanes are lost (with time-based memory)"""
+        # First check: if we have recent good detection, not lost
+        if self.last_good_detection_time > 0:
+            time_since_good = time.time() - self.last_good_detection_time
+            if time_since_good < LANE_MEMORY_DURATION:
+                return False  # Still within memory window
+        
+        # Second check: frame-based detection
         if len(self.lanes_ok_window) == self.lanes_ok_window.maxlen:
             return sum(self.lanes_ok_window) <= MISS_THRESH
         return False
+    
+    def get_lane_lost_duration(self):
+        """Get how long lanes have been lost (in seconds)"""
+        if self.lane_lost_start_time == 0.0:
+            return 0.0
+        return time.time() - self.lane_lost_start_time
+    
+    def reset_lane_lost_timer(self):
+        """Reset lane lost timer (called when stopped at traffic light)"""
+        self.lane_lost_start_time = 0.0
+
+    def compute_centerline_curvature(self):
+        """Compute approximate centerline curvature (1/m) using fitted lane coefficients.
+        Returns (curvature, classification_str) where classification_str in
+        {'straight','gentle','moderate','sharp'}.
+        Curvature thresholds are heuristic and can be tuned.
+        """
+        cL = self.last_coeff_left
+        cR = self.last_coeff_right
+        if cL is None and cR is None:
+            return None, None
+
+        bev_h = getattr(self, 'bev_h', None)
+        if bev_h is None:
+            return None, None
+        y_eval_px = bev_h - LOOK_Y_OFFSET  # same look-ahead as lateral error
+
+        px_to_m_x = getattr(self, 'px_to_m_x', None)
+        px_to_m_y = getattr(self, 'px_to_m_y', None)
+        if px_to_m_x is None or px_to_m_y is None or px_to_m_y == 0:
+            return None, None
+
+        def curvature_from_coeff(coeff):
+            Q2, Q1, _ = coeff
+            dx_dy = 2.0 * Q2 * y_eval_px + Q1
+            d2x_dy2 = 2.0 * Q2
+            dx_dy_m = dx_dy * (px_to_m_x / px_to_m_y)
+            d2x_dy2_m = d2x_dy2 * (px_to_m_x / (px_to_m_y ** 2))
+            denom = (1.0 + dx_dy_m * dx_dy_m) ** 1.5
+            if denom <= 1e-6:
+                return 0.0
+            return abs(d2x_dy2_m) / denom
+
+        curvatures = []
+        if cL is not None:
+            curvatures.append(curvature_from_coeff(cL))
+        if cR is not None:
+            curvatures.append(curvature_from_coeff(cR))
+        if not curvatures:
+            return None, None
+        kappa = sum(curvatures) / len(curvatures)
+
+        # Classification thresholds (approx lane curvature in 1/m)
+        # Straight: <0.005
+        # Gentle:  <0.010
+        # Moderate:<0.015
+        # Sharp:   <0.020
+        # Very Sharp: >=0.020 (tight bend)
+        if kappa < 0.010:
+            cls = 'straight'
+        elif kappa < 0.015:
+            cls = 'gentle'
+        elif kappa < 0.020:
+            cls = 'moderate'
+        elif kappa < 0.025:
+            cls = 'sharp'
+        else:
+            cls = 'very_sharp'
+        return kappa, cls
     
     # Helper methods (copy from ard_man_copy.py)
     def _calculate_lane_center(self, lanes):

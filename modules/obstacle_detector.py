@@ -44,10 +44,13 @@ class ObstacleDetector:
         self.focal_length = None
         self.image_height = None
         
-        # Distance thresholds (meters)
-        self.stop_distance = 15.0
-        self.danger_distance = 10.0
-        self.warning_distance = 20.0
+        # Base distance thresholds (meters) - will be adjusted by speed
+        self.base_stop_distance = 15.0
+        self.base_danger_distance = 10.0
+        self.base_warning_distance = 20.0
+        
+        # Speed-adaptive coefficients
+        self.speed_factor = 0.5  # Add 0.5m per km/h to stop distance
         
         # Lane filtering
         self.lane_mask = None
@@ -55,7 +58,31 @@ class ObstacleDetector:
         
         print(f"✓ Obstacle Detector initialized")
         print(f"  Model: {model_path}")
-        print(f"  Stop distance: {self.stop_distance}m")
+        print(f"  Base stop distance: {self.base_stop_distance}m (speed-adaptive)")
+    
+    def get_speed_adaptive_thresholds(self, vehicle_speed_kmh: float) -> Dict[str, float]:
+        """
+        Calculate speed-adaptive safety distances
+        
+        Physics: Braking distance ∝ speed²
+        We use linear approximation for computational efficiency
+        
+        Args:
+            vehicle_speed_kmh: Current vehicle speed in km/h
+            
+        Returns:
+            Dict with 'stop', 'danger', 'warning', 'slowdown' distances
+        """
+        # Speed adjustment: add distance based on speed
+        # At 30 km/h: +15m, At 50 km/h: +25m
+        speed_adjustment = vehicle_speed_kmh * self.speed_factor
+        
+        return {
+            'emergency_stop': self.base_danger_distance + speed_adjustment * 0.5,  # Immediate danger
+            'stop': self.base_stop_distance + speed_adjustment,  # Must stop
+            'warning': self.base_warning_distance + speed_adjustment * 1.5,  # Start slowing
+            'slowdown': self.base_warning_distance + speed_adjustment * 2.0  # Early deceleration
+        }
     
     def calibrate_camera(self, image_width: int, image_height: int, fov_degrees: float = 90):
         """Calibrate camera focal length"""
@@ -64,9 +91,18 @@ class ObstacleDetector:
         self.focal_length = (image_width / 2.0) / np.tan(fov_radians / 2.0)
         print(f"  ✓ Camera calibrated: f={self.focal_length:.1f}px")
     
-    def detect(self, image: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
-        """Run YOLO detection and calculate distances"""
+    def detect(self, image: np.ndarray, vehicle_speed_kmh: float = 0.0) -> Tuple[List[Dict], np.ndarray]:
+        """
+        Run YOLO detection and calculate distances
+        
+        Args:
+            image: Input image
+            vehicle_speed_kmh: Current vehicle speed for adaptive thresholds
+        """
         results = self.model(image, conf=self.conf_threshold, verbose=False)
+        
+        # Get speed-adaptive thresholds
+        thresholds = self.get_speed_adaptive_thresholds(vehicle_speed_kmh)
         
         detections = []
         
@@ -82,9 +118,21 @@ class ObstacleDetector:
                 bbox_height = y2 - y1
                 distance = self._estimate_distance(bbox_height, class_name)
                 
+                # Determine danger level based on speed-adaptive thresholds
+                danger_level = 'safe'
                 is_dangerous = False
+                
                 if distance is not None:
-                    is_dangerous = distance <= self.stop_distance
+                    if distance <= thresholds['emergency_stop']:
+                        danger_level = 'emergency'
+                        is_dangerous = True
+                    elif distance <= thresholds['stop']:
+                        danger_level = 'stop'
+                        is_dangerous = True
+                    elif distance <= thresholds['warning']:
+                        danger_level = 'warning'
+                    elif distance <= thresholds['slowdown']:
+                        danger_level = 'slowdown'
                 
                 detection = {
                     'bbox': (int(x1), int(y1), int(x2), int(y2)),
@@ -93,6 +141,7 @@ class ObstacleDetector:
                     'class_id': class_id,
                     'distance': distance,
                     'is_dangerous': is_dangerous,
+                    'danger_level': danger_level,
                     'bbox_center': (int((x1 + x2) / 2), int((y1 + y2) / 2)),
                     'in_lane': False
                 }
@@ -147,21 +196,41 @@ class ObstacleDetector:
         
         return filtered
     
-    def should_stop(self, lane_detections: List[Dict]) -> Tuple[bool, Optional[Dict]]:
-        """Determine if vehicle should stop"""
+    def should_stop(self, lane_detections: List[Dict], vehicle_speed_kmh: float = 0.0) -> Tuple[str, Optional[Dict]]:
+        """
+        Determine vehicle action based on obstacles
+        
+        Args:
+            lane_detections: List of detected objects in lane
+            vehicle_speed_kmh: Current vehicle speed
+            
+        Returns:
+            Tuple of (action, nearest_obstacle)
+            action: 'emergency_stop', 'stop', 'slow', 'cautious', 'drive'
+        """
         if not lane_detections:
-            return False, None
+            return 'drive', None
         
-        dangerous_objects = [d for d in lane_detections if d.get('is_dangerous', False)]
+        # Sort by distance (closest first)
+        lane_detections.sort(key=lambda x: x.get('distance', float('inf')))
         
-        if not dangerous_objects:
-            return False, None
+        # Find highest danger level
+        danger_levels = [d.get('danger_level', 'safe') for d in lane_detections]
         
-        # Sort by distance
-        dangerous_objects.sort(key=lambda x: x.get('distance', float('inf')))
-        nearest = dangerous_objects[0]
+        if 'emergency' in danger_levels:
+            nearest = next(d for d in lane_detections if d.get('danger_level') == 'emergency')
+            return 'emergency_stop', nearest
+        elif 'stop' in danger_levels:
+            nearest = next(d for d in lane_detections if d.get('danger_level') == 'stop')
+            return 'stop', nearest
+        elif 'warning' in danger_levels:
+            nearest = next(d for d in lane_detections if d.get('danger_level') == 'warning')
+            return 'slow', nearest
+        elif 'slowdown' in danger_levels:
+            nearest = next(d for d in lane_detections if d.get('danger_level') == 'slowdown')
+            return 'cautious', nearest
         
-        return True, nearest
+        return 'drive', None
     
     def _estimate_distance(self, bbox_height: float, object_class: str) -> Optional[float]:
         """Estimate distance using pinhole camera model"""
@@ -271,29 +340,35 @@ class ObstacleDetector:
             distance = det.get('distance')
             class_name = det['class']
             confidence = det['confidence']
-            is_dangerous = det.get('is_dangerous', False)
+            danger_level = det.get('danger_level', 'safe')
             in_lane = det.get('in_lane', False)
             
-            # Color based on distance and lane position
-            if in_lane and is_dangerous:
-                if distance is not None:
-                    if distance < self.danger_distance:
-                        color = (0, 0, 255)  # Red
-                    elif distance < self.stop_distance:
-                        color = (0, 140, 255)  # Orange
-                    else:
-                        color = (0, 255, 255)  # Yellow
-                else:
-                    color = (0, 255, 0)  # Green
-            else:
-                color = (0, 255, 0)  # Green (safe)
+            # Color based on danger level
+            color_map = {
+                'emergency': (0, 0, 255),      # Red - immediate danger
+                'stop': (0, 69, 255),          # Orange-Red - must stop
+                'warning': (0, 165, 255),      # Orange - slow down
+                'slowdown': (0, 255, 255),     # Yellow - be cautious
+                'safe': (0, 255, 0)            # Green - safe
+            }
             
-            thickness = 3 if (in_lane and is_dangerous) else 2
+            color = color_map.get(danger_level, (0, 255, 0))
+            
+            # Thicker border for dangerous objects in lane
+            if in_lane and danger_level in ['emergency', 'stop']:
+                thickness = 4
+            elif in_lane:
+                thickness = 3
+            else:
+                thickness = 2
+            
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
             
-            # Label
+            # Label with danger level
             if distance is not None:
                 label = f"{class_name} {distance:.1f}m"
+                if danger_level != 'safe':
+                    label += f" [{danger_level.upper()}]"
             else:
                 label = f"{class_name}"
             

@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from modules.lane_detector import LaneDetector
 from modules.obstacle_detector import ObstacleDetector
+from modules.traffic_light_detector import TrafficLightDetector
 from core.pid_controller import PIDController
+from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
 
 # UPDATED: Import from detection module
@@ -25,7 +27,7 @@ from detection.yolo_lane_filter import YOLOLaneFilter
 # Control parameters
 PID_KP, PID_KI, PID_KD = 0.55, 0.02, 0.22
 STEER_LIMIT = 0.25
-TARGET_SPEED = 10.0  # km/h
+TARGET_SPEED = 15.0  # km/h
 
 # Manual driving parameters
 MAN_STEER_STEP = 0.04
@@ -56,6 +58,20 @@ class DrivingAgent:
             img_height=self.lane_detector.img_h
         )
         
+        # Traffic light detector
+        self.traffic_light_detector = TrafficLightDetector(
+            model_path="v9 - 64 epochs.pt"
+        )
+        self.traffic_light_enabled = self.traffic_light_detector.is_available()
+        
+        # Optional: Customize traffic light ROI region if needed
+        # Uncomment and adjust these values to change detection area:
+        # self.traffic_light_detector.roi_top_ratio = 0.0    # Top: 0% from top
+        # self.traffic_light_detector.roi_bottom_ratio = 0.4   # Bottom: 40% from top
+        # self.traffic_light_detector.roi_left_ratio = 0.4     # Left: 40% from left
+        # self.traffic_light_detector.roi_right_ratio = 0.8    # Right: 75% from left
+        # self.traffic_light_detector.zoom_scale = 1.75        # Zoom factor
+        
         # Calibrate obstacle detector
         self.obstacle_detector.calibrate_camera(
             self.lane_detector.img_w, 
@@ -63,19 +79,27 @@ class DrivingAgent:
             fov_degrees=90
         )
         
-        # Initialize PID controller for steering
+        # Initialize controllers
+        # Keep PID available, but default to curvature-based non-PID controller for smoothness
         self.pid_controller = PIDController(
             kp=PID_KP, ki=PID_KI, kd=PID_KD,
             i_limit=0.6, rate_limit=0.03, out_limit=STEER_LIMIT, sign=-1.0
         )
+        self.curv_controller = CurvatureSteeringController(
+            wheelbase_m=2.9, k_p_lat=0.12, out_limit=STEER_LIMIT, rate_limit=0.03, ff_gain=1.0
+        )
         
         # State variables
         self.mode = 'manual'  # 'manual' or 'auto'
+        self.controller_type = 'curvature'  # 'curvature' or 'pid'
         self.target_speed = TARGET_SPEED
         self.gradual_stop_active = False
+        self.emergency_stop_active = False  # NEW: For imminent collision
+        self.obstacle_action = 'drive'  # NEW: Current obstacle avoidance action
         self.gradual_stop_rate = 0.1
         self.steering_history = deque(maxlen=4)
         self.frame_count = 0
+        self.last_lanes_detected = 0  # track lane count for adaptive speed clamping when vision weak
         
         # Manual control state
         self.manual_throttle = 0.0
@@ -100,6 +124,10 @@ class DrivingAgent:
         
         print("✓ Driving Agent initialized")
         print(f"  Mode: {self.mode.upper()}")
+        if self.traffic_light_enabled:
+            print(f"  Traffic Light Detection: ENABLED")
+        else:
+            print(f"  Traffic Light Detection: DISABLED")
     
     def set_mode(self, mode: str):
         """Switch between manual and auto mode"""
@@ -220,6 +248,11 @@ class DrivingAgent:
     def process_frame(self, image):
         """Process single frame and return control decision"""
         
+        # Detect traffic lights (works in both modes)
+        traffic_light_data = None
+        if self.traffic_light_enabled:
+            traffic_light_data = self.traffic_light_detector.detect(image)
+        
         # Manual mode
         if self.mode == 'manual':
             lane_result = self.lane_detector.detect(image)
@@ -229,8 +262,8 @@ class DrivingAgent:
                 # CREATE LANE MASK - defaults: 80% single, 90% dual
                 self.yolo_lane_filter.create_lane_mask_from_lanes(
                     lane_result['filtered_lanes'],
-                    expansion_width=50,
-                    forward_extension=300
+                    expansion_width=10,
+                    forward_extension=250
                     # Uses default: max_vertical_extent_single=0.8, max_vertical_extent_dual=0.9
                 )
                 
@@ -253,17 +286,25 @@ class DrivingAgent:
                     'nearest_obstacle': None,
                     'should_stop': False
                 },
+                'traffic_light_data': traffic_light_data,
                 'decision': 'MANUAL CONTROL'
             }
         
         # Auto mode
         lane_result = self.lane_detector.detect(image)
         if lane_result is None:
-            return self._emergency_stop()
+            result = self._emergency_stop()
+            result['traffic_light_data'] = traffic_light_data
+            return result
+        # Update lane count for speed policy
+        self.last_lanes_detected = lane_result.get('lanes_detected', 0)
         
         lateral_error = self.lane_detector.compute_lateral_error(lane_result['filtered_lanes'])
         
-        all_detections, _ = self.obstacle_detector.detect(image)
+        # Get current speed for adaptive detection
+        current_speed = self._get_vehicle_speed()
+        
+        all_detections, _ = self.obstacle_detector.detect(image, vehicle_speed_kmh=current_speed)
         
         # CREATE LANE MASK - defaults: 80% single, 90% dual
         self.yolo_lane_filter.create_lane_mask_from_lanes(
@@ -279,13 +320,51 @@ class DrivingAgent:
             overlap_threshold=0.3
         )
         
-        should_stop, nearest_obstacle = self.obstacle_detector.should_stop(lane_detections)
+        # Get obstacle action with speed-adaptive thresholds
+        obstacle_action, nearest_obstacle = self.obstacle_detector.should_stop(
+            lane_detections, 
+            vehicle_speed_kmh=current_speed
+        )
+        self.obstacle_action = obstacle_action
         
         lane_lost = self.lane_detector.is_lane_lost()
         
+        # Check traffic light state
+        traffic_light_stop = False
+        traffic_light_decision = None
+        if self.traffic_light_enabled and traffic_light_data:
+            # Get CARLA traffic light state if available
+            carla_tl_state = None
+            tl_actor = self.vehicle.get_traffic_light()
+            if tl_actor is not None:
+                try:
+                    carla_tl_state = TrafficLightDetector.carla_tl_to_str(tl_actor.get_state())
+                except RuntimeError:
+                    carla_tl_state = None
+            
+            # Get control decision from traffic light detector
+            vehicle_speed = self._get_vehicle_speed()
+            tl_decision_text, tl_control_action, tl_brake_force = \
+                self.traffic_light_detector.get_control_decision(
+                    traffic_light_data['model_state'],
+                    carla_tl_state,
+                    vehicle_speed
+                )
+            
+            # Traffic light takes priority over obstacle detection
+            if tl_control_action in ['stop', 'slow']:
+                traffic_light_stop = True
+                traffic_light_decision = (tl_decision_text, tl_control_action, tl_brake_force)
+        
         control, decision = self._make_control_decision(
-            lateral_error, should_stop, lane_lost, nearest_obstacle
+            lateral_error, obstacle_action, lane_lost, nearest_obstacle,
+            traffic_light_stop, traffic_light_decision
         )
+
+        # Store curvature info for visualization
+        kappa, kappa_cls = self.lane_detector.compute_centerline_curvature()
+        self.last_curvature = kappa
+        self.last_curvature_class = kappa_cls
         
         return {
             'control': control,
@@ -294,65 +373,323 @@ class DrivingAgent:
                 'all_detections': all_detections,
                 'lane_detections': lane_detections,
                 'nearest_obstacle': nearest_obstacle,
-                'should_stop': should_stop
+                'obstacle_action': obstacle_action
             },
+            'traffic_light_data': traffic_light_data,
             'decision': decision
         }
     
     def _make_control_decision(self, lateral_error: Optional[float], 
-                               should_stop: bool, lane_lost: bool,
-                               nearest_obstacle: Optional[Dict]) -> Tuple[carla.VehicleControl, str]:
+                               obstacle_action: str, lane_lost: bool,
+                               nearest_obstacle: Optional[Dict],
+                               traffic_light_stop: bool = False,
+                               traffic_light_decision: Optional[Tuple] = None) -> Tuple[carla.VehicleControl, str]:
         """Make control decision based on perception"""
         control = carla.VehicleControl()
         current_speed = self._get_vehicle_speed()
         
-        # Determine if stopping
+        # Traffic light has highest priority
+        if traffic_light_stop and traffic_light_decision:
+            tl_decision_text, tl_control_action, tl_brake_force = traffic_light_decision
+            
+            # CRITICAL FIX: Reset lane lost timer when stopped at traffic light
+            # This prevents "emergency stop" when lanes are temporarily lost at red light
+            if tl_control_action in ['stop', 'slow']:
+                self.lane_detector.reset_lane_lost_timer()
+            
+            if tl_control_action == 'stop':
+                control.throttle = 0.0
+                control.brake = tl_brake_force
+                control.steer = self.steering_history[-1] * 0.8 if self.steering_history else 0.0
+                return control, f"TL: {tl_decision_text}"
+            
+            elif tl_control_action == 'slow':
+                control.throttle = 0.0
+                control.brake = tl_brake_force
+                control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+                return control, f"TL: {tl_decision_text}"
+            
+            elif tl_control_action == 'resume':
+                # Apply resume throttle
+                control.throttle = self.traffic_light_detector.resume_throttle
+                control.brake = 0.0
+                # Preserve steering
+                if lateral_error is not None:
+                    last_steer = self.steering_history[-1] if self.steering_history else None
+                    control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                    self.steering_history.append(control.steer)
+                else:
+                    control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+                return control, f"TL: {tl_decision_text}"
+        
+        # IMPORTANT: If traffic light is in 'drive' or 'resume' mode, ignore lane loss
+        # This allows car to move after green light even if lanes temporarily lost
+        if self.traffic_light_enabled and traffic_light_decision:
+            tl_decision_text, tl_control_action, tl_brake_force = traffic_light_decision
+            if tl_control_action in ['drive', 'resume']:
+                # Traffic light says GO - ignore lane loss temporarily
+                lane_lost = False
+                self.lane_detector.reset_lane_lost_timer()
+        
+        # Determine if stopping for obstacles/lane loss
         if lane_lost:
-            self.gradual_stop_active = True
-            decision = "STOP: Lane loss"
-        elif should_stop:
-            self.gradual_stop_active = True
+            # Option C: Slow-down mode with progressive severity
+            lane_lost_duration = self.lane_detector.get_lane_lost_duration()
+            
+            if lane_lost_duration < 3.0:
+                # Phase 1: Caution mode (0-3 seconds) - slow down but keep moving
+                control.throttle = 0.15  # Reduced speed
+                control.brake = 0.2
+                # Map-based steering fallback to avoid drifting off road
+                steer_map = self._map_based_steer(lookahead_m=12.0)
+                if steer_map is not None:
+                    control.steer = steer_map
+                else:
+                    # Use last known steering
+                    if self.steering_history:
+                        control.steer = self.steering_history[-1] * 0.95
+                    else:
+                        control.steer = 0.0
+                decision = f"CAUTION: Lane loss ({lane_lost_duration:.1f}s) - using memory"
+                self.gradual_stop_active = False
+            else:
+                # Phase 2: Emergency stop (>3 seconds) - full stop
+                self.gradual_stop_active = True
+                decision = f"EMERGENCY STOP: Lane loss timeout ({lane_lost_duration:.1f}s)"
+        
+        # Handle obstacle-based actions
+        elif obstacle_action == 'emergency_stop':
+            self.emergency_stop_active = True
+            self.gradual_stop_active = False
             if nearest_obstacle:
                 dist = nearest_obstacle.get('distance', 'unknown')
-                decision = f"STOP: {nearest_obstacle['class']} at {dist}m"
+                decision = f"EMERGENCY BRAKE: {nearest_obstacle['class']} at {dist:.1f}m!"
+            else:
+                decision = "EMERGENCY BRAKE: Imminent collision!"
+        
+        elif obstacle_action == 'stop':
+            self.gradual_stop_active = True
+            self.emergency_stop_active = False
+            if nearest_obstacle:
+                dist = nearest_obstacle.get('distance', 'unknown')
+                decision = f"STOP: {nearest_obstacle['class']} at {dist:.1f}m"
             else:
                 decision = "STOP: Obstacle"
-        else:
+        
+        elif obstacle_action in ['slow', 'cautious']:
+            # Slowdown modes - don't engage full stop
             self.gradual_stop_active = False
+            self.emergency_stop_active = False
+            if nearest_obstacle:
+                dist = nearest_obstacle.get('distance', 'unknown')
+                if obstacle_action == 'slow':
+                    decision = f"SLOWING: {nearest_obstacle['class']} at {dist:.1f}m"
+                else:
+                    decision = f"CAUTIOUS: {nearest_obstacle['class']} ahead at {dist:.1f}m"
+            else:
+                decision = "SLOWING: Obstacle ahead"
+        
+        else:  # 'drive'
+            self.gradual_stop_active = False
+            self.emergency_stop_active = False
             decision = "DRIVE: Normal"
         
         # Apply control
-        if self.gradual_stop_active:
-            # Gradual stop
+        if self.emergency_stop_active:
+            # EMERGENCY: Maximum braking force
+            control.throttle = 0.0
+            control.brake = 1.0
+            control.steer = self.steering_history[-1] * 0.8 if self.steering_history else 0.0
+        
+        elif self.gradual_stop_active:
+            # Gradual stop with speed-adaptive braking
             if current_speed > 1.0:
                 control.throttle = 0.0
-                control.brake = min(1.0, self.gradual_stop_rate)
+                # Progressive brake force based on speed
+                if current_speed > 30:
+                    control.brake = 0.8
+                elif current_speed > 20:
+                    control.brake = 0.6
+                elif current_speed > 10:
+                    control.brake = 0.4
+                else:
+                    control.brake = 0.2
                 control.steer = self.steering_history[-1] * 0.8 if self.steering_history else 0.0
             else:
                 control.throttle = 0.0
                 control.brake = 1.0
                 control.steer = 0.0
-        else:
-            # Normal driving
-            # Speed control
-            if current_speed < self.target_speed - 5:
-                control.throttle, control.brake = 0.7, 0.0
-            elif current_speed < self.target_speed:
-                control.throttle, control.brake = 0.4, 0.0
-            elif current_speed > self.target_speed + 5:
-                control.throttle, control.brake = 0.0, 0.3
+        
+        elif obstacle_action == 'slow':
+            # Active slowdown: reduce speed significantly
+            control.throttle = 0.0
+            if current_speed > 20:
+                control.brake = 0.5
+            elif current_speed > 15:
+                control.brake = 0.3
             else:
-                control.throttle, control.brake = 0.2, 0.0
-            
-            # Steering control
+                control.brake = 0.15
+            # Maintain steering
             if lateral_error is not None:
                 last_steer = self.steering_history[-1] if self.steering_history else None
-                control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                if self.controller_type == 'curvature':
+                    control.steer = self.curv_controller.step(
+                        lane_detector=self.lane_detector,
+                        lateral_error_m=lateral_error,
+                        speed_kmh=current_speed,
+                        last_out=last_steer
+                    )
+                else:
+                    control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
                 self.steering_history.append(control.steer)
             else:
                 control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
         
+        elif obstacle_action == 'cautious':
+            # Cautious mode: gentle deceleration, reduce target speed
+            reduced_target = min(self.target_speed * 0.6, 20.0)  # Max 20 km/h in cautious mode
+            speed_err = reduced_target - current_speed
+            
+            if speed_err < -2:
+                control.throttle = 0.0
+                control.brake = 0.2
+            elif speed_err < 0:
+                control.throttle = 0.0
+                control.brake = 0.0
+            else:
+                control.throttle = 0.2
+                control.brake = 0.0
+            
+            # Maintain steering
+            if lateral_error is not None:
+                last_steer = self.steering_history[-1] if self.steering_history else None
+                if self.controller_type == 'curvature':
+                    control.steer = self.curv_controller.step(
+                        lane_detector=self.lane_detector,
+                        lateral_error_m=lateral_error,
+                        speed_kmh=current_speed,
+                        last_out=last_steer
+                    )
+                else:
+                    control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                self.steering_history.append(control.steer)
+            else:
+                control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+        
+        else:
+            # Normal driving (obstacle_action == 'drive')
+            # Normal driving
+            # Adaptive target speed based on curvature (if available)
+            kappa, kappa_cls = self.lane_detector.compute_centerline_curvature()
+            # Updated speed policy:
+            # straight: 30 km/h
+            # gentle: 28 km/h
+            # moderate: 26 km/h
+            # sharp: 25 km/h
+            # very_sharp: 18 km/h (tight bend safety)
+            if kappa is not None and kappa_cls is not None:
+                if kappa_cls == 'straight':
+                    dyn_target = 40.0
+                elif kappa_cls == 'gentle':
+                    dyn_target = 35.0
+                elif kappa_cls == 'moderate':
+                    dyn_target = 30.0
+                elif kappa_cls == 'sharp':
+                    dyn_target = 25.0
+                else:  # very_sharp
+                    dyn_target = 20.0
+            else:
+                dyn_target = 15.0  # unknown curvature fallback
+
+            # Clamp based on lane visibility
+            if self.last_lanes_detected <= 0:       # no lanes
+                dyn_target = min(dyn_target, 12.0)
+            elif self.last_lanes_detected == 1:     # single lane
+                dyn_target = min(dyn_target, 15.0)
+            # (2+ lanes -> keep dyn_target)
+            self.target_speed = dyn_target
+
+            # Speed control toward dynamic target
+            # Speed control bands tuned for smoother approach to target
+            speed_err = self.target_speed - current_speed
+            if speed_err > 8:
+                control.throttle, control.brake = 0.80, 0.0
+            elif speed_err > 4:
+                control.throttle, control.brake = 0.55, 0.0
+            elif speed_err > 1:
+                control.throttle, control.brake = 0.35, 0.0
+            elif speed_err < -5:
+                control.throttle, control.brake = 0.0, 0.5
+            elif speed_err < -2:
+                control.throttle, control.brake = 0.05, 0.3
+            else:
+                control.throttle, control.brake = 0.18, 0.0
+            
+            # Steering control (prefer map-based when lanes weak)
+            use_map_fallback = (self.last_lanes_detected <= 1)
+            map_steer = self._map_based_steer(lookahead_m=12.0) if use_map_fallback else None
+            if map_steer is not None:
+                control.steer = map_steer
+            else:
+                last_steer = self.steering_history[-1] if self.steering_history else None
+                if self.controller_type == 'curvature':
+                    control.steer = self.curv_controller.step(
+                        lane_detector=self.lane_detector,
+                        lateral_error_m=lateral_error,
+                        speed_kmh=current_speed,
+                        last_out=last_steer
+                    )
+                else:
+                    # Fallback to PID if selected
+                    if lateral_error is not None:
+                        control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                    else:
+                        control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+            self.steering_history.append(control.steer)
+        
         return control, decision
+
+    def _map_based_steer(self, lookahead_m: float = 12.0) -> Optional[float]:
+        """Compute a simple steering command toward a lookahead waypoint on the road centerline.
+        Returns steer in [-STEER_LIMIT, STEER_LIMIT] or None on failure.
+        """
+        try:
+            world_map = self.world.get_map()
+            if world_map is None:
+                return None
+            veh_tf = self.vehicle.get_transform()
+            veh_loc = veh_tf.location
+            curr_wp = world_map.get_waypoint(veh_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if curr_wp is None:
+                return None
+            next_wps = curr_wp.next(lookahead_m)
+            if not next_wps:
+                # try shorter lookahead
+                next_wps = curr_wp.next(5.0)
+                if not next_wps:
+                    return None
+            target_wp = next_wps[0]
+            tgt = target_wp.transform.location
+            import math
+            # Vehicle forward unit vector in world XY
+            yaw = math.radians(veh_tf.rotation.yaw)
+            fwd_x, fwd_y = math.cos(yaw), math.sin(yaw)
+            # Target direction unit vector in world XY
+            dx, dy = (tgt.x - veh_loc.x), (tgt.y - veh_loc.y)
+            dist = math.hypot(dx, dy)
+            if dist < 1e-3:
+                return 0.0
+            tx, ty = dx / dist, dy / dist
+            # Signed yaw error (left positive) via atan2(cross, dot)
+            cross_z = fwd_x * ty - fwd_y * tx
+            dot = fwd_x * tx + fwd_y * ty
+            yaw_err = math.atan2(cross_z, dot)
+            # Map yaw error (rad) to steer with gain, clamp to limits
+            k_yaw = 0.8
+            steer = max(-STEER_LIMIT, min(STEER_LIMIT, k_yaw * yaw_err))
+            return float(steer)
+        except Exception:
+            return None
     
     def _emergency_stop(self) -> Dict:
         """Emergency stop"""
@@ -365,6 +702,7 @@ class DrivingAgent:
             'control': control,
             'lane_data': None,
             'obstacle_data': None,
+            'traffic_light_data': None,
             'decision': "EMERGENCY: No data"
         }
     
@@ -390,7 +728,11 @@ class DrivingAgent:
     
     def visualize(self, image, result: Dict) -> Tuple:
         """Create visualization"""
-        vis = image.copy()
+        # Start with traffic light visualization if available
+        if result.get('traffic_light_data'):
+            vis = result['traffic_light_data']['visualization'].copy()
+        else:
+            vis = image.copy()
         
         # NEW: Draw lane mask using YOLOLaneFilter (the working one)
         if self.show_lane_mask:
@@ -454,6 +796,9 @@ class DrivingAgent:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
         cv2.putText(vis, f"Speed: {speed:.1f} km/h", (10, 90), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if hasattr(self, 'last_curvature') and self.last_curvature is not None:
+            cv2.putText(vis, f"Curv: {self.last_curvature:.4f} ({self.last_curvature_class})", (10, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2)
         
         if result['lane_data']:
             lanes_detected = result['lane_data']['lanes_detected']
@@ -465,9 +810,29 @@ class DrivingAgent:
             cv2.putText(vis, f"Lane Objects: {obs_count}", (10, 150), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
+        # Traffic light status
+        if result.get('traffic_light_data'):
+            tl_state = result['traffic_light_data']['model_state']
+            if tl_state:
+                # Color based on state
+                if tl_state == 'red':
+                    tl_color = (0, 0, 255)
+                elif tl_state == 'green':
+                    tl_color = (0, 255, 0)
+                elif tl_state == 'yellow':
+                    tl_color = (0, 255, 255)
+                else:
+                    tl_color = (255, 255, 255)
+                
+                cv2.putText(vis, f"Traffic Light: {tl_state.upper()}", (10, 180), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, tl_color, 2)
+            else:
+                cv2.putText(vis, "Traffic Light: None", (10, 180), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
+        
         # ROI status
         roi_status = "Active" if len(roi_points) == 3 else "Inactive"
-        cv2.putText(vis, f"ROI: {roi_status}", (10, 180), 
+        cv2.putText(vis, f"ROI: {roi_status}", (10, 210), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         
         # Controls help

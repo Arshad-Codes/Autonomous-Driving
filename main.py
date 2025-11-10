@@ -22,7 +22,27 @@ class AutonomousDrivingSystem:
         # Connect to CARLA
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
-        self.world = self.client.load_world('Town04')
+        self.world = self.client.load_world('Town10HD')
+        
+        # Initial weather (can be changed later via hotkeys)
+        weather = carla.WeatherParameters.ClearSunset
+        # weather = carla.WeatherParameters.WetSunset
+        # weather = carla.WeatherParameters.WetNoon
+        # weather = carla.WeatherParameters.WetCloudyNoon
+        # weather = carla.WeatherParameters.WetCloudySunset
+        # weather = carla.WeatherParameters.ClearNoon 
+        # weather = carla.WeatherParameters.HardRainSunset
+        # weather = carla.WeatherParameters.SoftRainNoon
+        # weather = carla.WeatherParameters.SoftRainSunset
+
+        # weather = carla.WeatherParameters.CloudyNoon
+        # weather = carla.WeatherParameters.CloudySunset
+        # weather = carla.WeatherParameters.WetNoon         
+        # weather = carla.WeatherParameters.MidRainyNoon
+        # weather = carla.WeatherParameters.MidRainSunset
+        # weather = carla.WeatherParameters.HardRainNoon
+        
+        self.world.set_weather(weather)
         
         # Spawn ego vehicle
         bp = self.world.get_blueprint_library()
@@ -51,28 +71,34 @@ class AutonomousDrivingSystem:
         print("✓ System initialized")
     
     def _camera_callback(self, image):
-        """Camera callback"""
+        """Camera callback - CARLA provides BGRA, convert to BGR for OpenCV"""
         import numpy as np
         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
         array = np.reshape(array, (image.height, image.width, 4))
-        array = array[:, :, :3]
-        array = array[:, :, ::-1]
+        # CARLA gives BGRA, we want BGR (drop alpha channel)
+        # No need to reverse channels - OpenCV expects BGR
+        array = array[:, :, :3]  # Keep BGR, drop alpha
         self.camera_data = array
     
     def run(self, duration=300, spawn_traffic=True):
         """Run autonomous driving"""
         print("\n" + "="*70)
         print("  CONTROLS:")
-        print("  [L] = Autonomous Mode")
+        print("  [L] = Autonomous Mode (with Traffic Light Detection)")
         print("  [M] = Manual Mode")
-        print("  [V] = Toggle Lane Mask Visualization")  # NEW
+        print("  [V] = Toggle Lane Mask Visualization")
+        print("  [N] = Night  [B] = Bright (Day)")
         print("  [W/A/S/D] = Manual throttle/brake/steering")
         print("  [Space] = Brake")
         print("  [Q] = Quit")
         print("="*70)
         print("\n⚠️  Vehicle starts in MANUAL mode")
         print("⚠️  Press [L] to enable AUTONOMOUS driving")
-        print("⚠️  Press [W] to start driving manually\n")
+        print("⚠️  Press [W] to start driving manually")
+        if self.agent.traffic_light_enabled:
+            print("✓  Traffic Light Detection: ACTIVE\n")
+        else:
+            print("⚠️  Traffic Light Detection: DISABLED\n")
         
         # Wait for camera
         print("⏳ Waiting for camera...")
@@ -108,6 +134,11 @@ class AutonomousDrivingSystem:
                 elif key == ord('l'):
                     self.agent.set_mode('auto')
                     self.agent.handle_roi_choice_when_auto(self.camera_data)
+                # Weather/time of day hotkeys
+                elif key == ord('n'):
+                    self.set_night()
+                elif key == ord('b'):
+                    self.set_day()
                 
                 # NEW: Toggle lane mask visualization
                 elif key == ord('v'):
@@ -194,6 +225,48 @@ class AutonomousDrivingSystem:
             print(f"   ⚠️ Vehicle cleanup error: {e}")
         
         print("✓ Cleanup complete")
+
+    # --- Day/Night helpers ---
+    def set_night(self):
+        """Set world to night-like lighting and turn on vehicle lights."""
+        try:
+            weather = self.world.get_weather()
+            # Negative/low sun altitude simulates night
+            weather.sun_altitude_angle = -10.0
+            # Optionally reduce scattering to make it darker
+            if hasattr(weather, 'scattering_intensity'):
+                weather.scattering_intensity = 0.2
+            if hasattr(weather, 'mie_scattering_scale'):
+                weather.mie_scattering_scale = 0.02
+            if hasattr(weather, 'rayleigh_scattering_scale'):
+                weather.rayleigh_scattering_scale = 0.02
+            self.world.set_weather(weather)
+
+            # Turn on vehicle lights (position + low beam)
+            try:
+                vls = carla.VehicleLightState
+                lights = vls.Position | vls.LowBeam
+                if hasattr(vls, 'Fog'):
+                    lights |= vls.Fog
+                self.vehicle.set_light_state(carla.VehicleLightState(lights))
+            except Exception:
+                pass
+            print("🌙 Night mode applied")
+        except Exception as e:
+            print(f"⚠️ Failed to set night: {e}")
+
+    def set_day(self):
+        """Set world to a bright day preset and turn off vehicle lights."""
+        try:
+            self.world.set_weather(carla.WeatherParameters.ClearNoon)
+            try:
+                # Turn off lights
+                self.vehicle.set_light_state(carla.VehicleLightState(0))
+            except Exception:
+                pass
+            print("☀️ Day mode applied")
+        except Exception as e:
+            print(f"⚠️ Failed to set day: {e}")
 
 
 def main():

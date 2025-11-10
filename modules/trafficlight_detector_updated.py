@@ -38,7 +38,7 @@ from ultralytics import YOLO
 # -----------------------------
 WEIGHTS_PATH = "v9 - 64 epochs.pt"  # your trained model
 CLASS_NAMES = ["green", "red", "yellow"]  # class order in your model
-WINDOW_W, WINDOW_H = 1000, 800
+WINDOW_W, WINDOW_H = 1280, 720
 CAM_FOV = "90"
 FPS = 30
 CONF_THRESH = 0.4
@@ -58,6 +58,41 @@ VEHICLE_SPEED_LIMIT = 120  # km/h - maximum speed for the vehicle
 # ROI/Zoom Detection Settings
 USE_ROI_ZOOM = True       # Enable ROI-based detection for better accuracy
 USE_DUAL_DETECTION = True # Process both zoomed and non-zoomed frames for better coverage
+USE_MULTIPLE_ROIS = True  # Enable multiple ROI regions
+
+# Multiple ROI definitions (top, bottom, left, right ratios)
+# You can define 2 or more ROIs to cover different areas
+ROI_DEFINITIONS = [
+    # ROI 1: Upper center (main traffic lights ahead)
+    {
+        'name': 'Center',
+        'top': 0.20,
+        'bottom': 0.40,
+        'left': 0.30,
+        'right': 0.60,
+        'zoom': 1.75
+    },
+    # ROI 2: Upper right (traffic lights on right side)
+    {
+        'name': 'Right',
+        'top': 0.40,
+        'bottom': 0.60,
+        'left': 0.50,
+        'right': 0.70,
+        'zoom': 1.5
+    },
+    # You can add more ROIs as needed:
+    # {
+    #     'name': 'Right',
+    #     'top': 0.25,
+    #     'bottom': 0.60,
+    #     'left': 0.60,
+    #     'right': 0.90,
+    #     'zoom': 1.5
+    # },
+]
+
+# Legacy single ROI settings (used when USE_MULTIPLE_ROIS = False)
 ROI_TOP_RATIO = 0.30       # Start from top of image (0%)
 ROI_BOTTOM_RATIO = 0.6    # End at 60% of image height (upper portion)
 ROI_LEFT_RATIO = 0.3      # Start from 30% from left (narrower focus)
@@ -369,8 +404,14 @@ def main():
     print(f"ROI Zoom Detection: {'ENABLED' if USE_ROI_ZOOM else 'DISABLED'}")
     print(f"Dual Detection (Zoom + No-Zoom): {'ENABLED' if USE_DUAL_DETECTION else 'DISABLED'}")
     if USE_ROI_ZOOM:
-        print(f"  ROI: Top={ROI_TOP_RATIO*100:.0f}% Bottom={ROI_BOTTOM_RATIO*100:.0f}% Left={ROI_LEFT_RATIO*100:.0f}% Right={ROI_RIGHT_RATIO*100:.0f}%")
-        print(f"  Zoom Scale: {ZOOM_SCALE}x")
+        if USE_MULTIPLE_ROIS and ROI_DEFINITIONS:
+            print(f"Multiple ROIs: {len(ROI_DEFINITIONS)} regions defined")
+            for idx, roi in enumerate(ROI_DEFINITIONS):
+                print(f"  ROI-{roi['name']}: Top={roi['top']*100:.0f}% Bottom={roi['bottom']*100:.0f}% "
+                      f"Left={roi['left']*100:.0f}% Right={roi['right']*100:.0f}% Zoom={roi.get('zoom', 1.0)}x")
+        else:
+            print(f"  ROI: Top={ROI_TOP_RATIO*100:.0f}% Bottom={ROI_BOTTOM_RATIO*100:.0f}% Left={ROI_LEFT_RATIO*100:.0f}% Right={ROI_RIGHT_RATIO*100:.0f}%")
+            print(f"  Zoom Scale: {ZOOM_SCALE}x")
 
     running = True
     try:
@@ -394,26 +435,51 @@ def main():
             img_original = img.copy()  # Keep original for display
             detection_images = []  # List of (image, offset, scale, source_name)
             
-            # Always include ROI-based detection
+            # Multiple ROI support
             if USE_ROI_ZOOM:
-                # Extract ROI (focus on upper center where TLs are)
-                roi_img, roi_offset = extract_roi(
-                    img, ROI_TOP_RATIO, ROI_BOTTOM_RATIO, 
-                    ROI_LEFT_RATIO, ROI_RIGHT_RATIO
-                )
-                
-                # Add non-zoomed ROI detection (good for nearby lights)
-                if USE_DUAL_DETECTION:
-                    detection_images.append((roi_img, roi_offset, 1.0, "ROI"))
-                
-                # Add zoomed ROI detection (good for distant lights)
-                if ZOOM_SCALE > 1.0:
-                    zoomed_img, zoom_offset, scale = zoom_image(roi_img, ZOOM_SCALE)
-                    # Combine offsets
-                    combined_offset = (roi_offset[0] + zoom_offset[0], roi_offset[1] + zoom_offset[1])
-                    detection_images.append((zoomed_img, combined_offset, scale, "Zoomed"))
+                if USE_MULTIPLE_ROIS and ROI_DEFINITIONS:
+                    # Use multiple ROI definitions
+                    for roi_def in ROI_DEFINITIONS:
+                        roi_name = roi_def['name']
+                        roi_img, roi_offset = extract_roi(
+                            img, 
+                            roi_def['top'], 
+                            roi_def['bottom'],
+                            roi_def['left'], 
+                            roi_def['right']
+                        )
+                        
+                        # Add non-zoomed ROI detection
+                        if USE_DUAL_DETECTION:
+                            detection_images.append((roi_img, roi_offset, 1.0, f"ROI-{roi_name}"))
+                        
+                        # Add zoomed ROI detection if zoom is specified
+                        zoom_scale = roi_def.get('zoom', 1.0)
+                        if zoom_scale > 1.0:
+                            zoomed_img, zoom_offset, scale = zoom_image(roi_img, zoom_scale)
+                            combined_offset = (roi_offset[0] + zoom_offset[0], roi_offset[1] + zoom_offset[1])
+                            detection_images.append((zoomed_img, combined_offset, scale, f"Zoom-{roi_name}"))
+                        elif not USE_DUAL_DETECTION:
+                            # If no zoom and no dual, still add the ROI
+                            detection_images.append((roi_img, roi_offset, 1.0, f"ROI-{roi_name}"))
                 else:
-                    detection_images.append((roi_img, roi_offset, 1.0, "ROI"))
+                    # Use legacy single ROI settings
+                    roi_img, roi_offset = extract_roi(
+                        img, ROI_TOP_RATIO, ROI_BOTTOM_RATIO, 
+                        ROI_LEFT_RATIO, ROI_RIGHT_RATIO
+                    )
+                    
+                    # Add non-zoomed ROI detection (good for nearby lights)
+                    if USE_DUAL_DETECTION:
+                        detection_images.append((roi_img, roi_offset, 1.0, "ROI"))
+                    
+                    # Add zoomed ROI detection (good for distant lights)
+                    if ZOOM_SCALE > 1.0:
+                        zoomed_img, zoom_offset, scale = zoom_image(roi_img, ZOOM_SCALE)
+                        combined_offset = (roi_offset[0] + zoom_offset[0], roi_offset[1] + zoom_offset[1])
+                        detection_images.append((zoomed_img, combined_offset, scale, "Zoomed"))
+                    else:
+                        detection_images.append((roi_img, roi_offset, 1.0, "ROI"))
             else:
                 # If ROI/Zoom disabled, just use full image
                 detection_images.append((img, (0, 0), 1.0, "Full"))
@@ -698,15 +764,32 @@ def main():
             # Draw ROI box if enabled
             if USE_ROI_ZOOM:
                 h, w = img_original.shape[:2]
-                roi_x1 = int(w * ROI_LEFT_RATIO)
-                roi_y1 = int(h * ROI_TOP_RATIO)
-                roi_x2 = int(w * ROI_RIGHT_RATIO)
-                roi_y2 = int(h * ROI_BOTTOM_RATIO)
-                # Draw semi-transparent ROI box
-                cv2.rectangle(img_original, (roi_x1, roi_y1), (roi_x2, roi_y2), 
-                            (255, 255, 0), 2)
-                cv2.putText(img_original, "ROI", (roi_x1 + 5, roi_y1 + 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                if USE_MULTIPLE_ROIS and ROI_DEFINITIONS:
+                    # Draw all ROI boxes
+                    roi_colors = [(255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 128, 0)]
+                    for idx, roi_def in enumerate(ROI_DEFINITIONS):
+                        roi_x1 = int(w * roi_def['left'])
+                        roi_y1 = int(h * roi_def['top'])
+                        roi_x2 = int(w * roi_def['right'])
+                        roi_y2 = int(h * roi_def['bottom'])
+                        color = roi_colors[idx % len(roi_colors)]
+                        cv2.rectangle(img_original, (roi_x1, roi_y1), (roi_x2, roi_y2), color, 2)
+                        label = f"ROI-{roi_def['name']}"
+                        if roi_def.get('zoom', 1.0) > 1.0:
+                            label += f" ({roi_def['zoom']}x)"
+                        cv2.putText(img_original, label, (roi_x1 + 5, roi_y1 + 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                else:
+                    # Draw single ROI box
+                    roi_x1 = int(w * ROI_LEFT_RATIO)
+                    roi_y1 = int(h * ROI_TOP_RATIO)
+                    roi_x2 = int(w * ROI_RIGHT_RATIO)
+                    roi_y2 = int(h * ROI_BOTTOM_RATIO)
+                    cv2.rectangle(img_original, (roi_x1, roi_y1), (roi_x2, roi_y2), 
+                                (255, 255, 0), 2)
+                    cv2.putText(img_original, "ROI", (roi_x1 + 5, roi_y1 + 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
             # Blit to pygame
             img_rgb = cv2.cvtColor(img_original, cv2.COLOR_BGR2RGB)
