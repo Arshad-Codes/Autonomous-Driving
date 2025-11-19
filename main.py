@@ -22,15 +22,15 @@ class AutonomousDrivingSystem:
         # Connect to CARLA
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
-        self.world = self.client.load_world('Town10HD')
+        self.world = self.client.load_world('Town04')
         
         # Initial weather (can be changed later via hotkeys)
-        weather = carla.WeatherParameters.ClearSunset
+        weather = carla.WeatherParameters.ClearNoon 
+        # weather = carla.WeatherParameters.ClearSunset
         # weather = carla.WeatherParameters.WetSunset
         # weather = carla.WeatherParameters.WetNoon
         # weather = carla.WeatherParameters.WetCloudyNoon
-        # weather = carla.WeatherParameters.WetCloudySunset
-        # weather = carla.WeatherParameters.ClearNoon 
+        # weather = carla.WeatherParameters.WetCloudySunset        
         # weather = carla.WeatherParameters.HardRainSunset
         # weather = carla.WeatherParameters.SoftRainNoon
         # weather = carla.WeatherParameters.SoftRainSunset
@@ -113,7 +113,7 @@ class AutonomousDrivingSystem:
         
         # Spawn traffic
         if spawn_traffic:
-            self.agent.spawn_traffic(num_vehicles=20, num_static=3)
+            self.agent.spawn_traffic(num_vehicles=100, num_static=3)
         
         # Main loop
         start_time = time.time()

@@ -24,8 +24,8 @@ from core.carla_spawner import CarlaSpawner
 # UPDATED: Import from detection module
 from detection.yolo_lane_filter import YOLOLaneFilter
 
-# Control parameters
-PID_KP, PID_KI, PID_KD = 0.55, 0.02, 0.22
+# Control parameters - Tuned for smooth steering at 15 km/h
+PID_KP, PID_KI, PID_KD = 0.45, 0.015, 0.28  # Lower P, higher D for smoother response
 STEER_LIMIT = 0.25
 TARGET_SPEED = 15.0  # km/h
 
@@ -52,11 +52,15 @@ class DrivingAgent:
         self.lane_detector = LaneDetector()
         self.obstacle_detector = ObstacleDetector()
         
-        # NEW: Use the working YOLOLaneFilter instead of obstacle_detector's simple mask
+        # NEW: Use the working YOLOLaneFilter with triangular ROI
         self.yolo_lane_filter = YOLOLaneFilter(
             img_width=self.lane_detector.img_w,
             img_height=self.lane_detector.img_h
         )
+        # Enable triangular ROI to prevent detecting adjacent lane objects
+        self.yolo_lane_filter.use_triangular_roi = True
+        # Adjust ROI width (20% = conservative, 25% = moderate, 30% = wide)
+        self.yolo_lane_filter.fixed_lane_width_ratio = 0.22
         
         # Traffic light detector
         self.traffic_light_detector = TrafficLightDetector(
@@ -83,7 +87,7 @@ class DrivingAgent:
         # Keep PID available, but default to curvature-based non-PID controller for smoothness
         self.pid_controller = PIDController(
             kp=PID_KP, ki=PID_KI, kd=PID_KD,
-            i_limit=0.6, rate_limit=0.03, out_limit=STEER_LIMIT, sign=-1.0
+            i_limit=0.5, rate_limit=0.025, out_limit=STEER_LIMIT, sign=-1.0  # Tighter rate limit
         )
         self.curv_controller = CurvatureSteeringController(
             wheelbase_m=2.9, k_p_lat=0.12, out_limit=STEER_LIMIT, rate_limit=0.03, ff_gain=1.0
@@ -91,7 +95,8 @@ class DrivingAgent:
         
         # State variables
         self.mode = 'manual'  # 'manual' or 'auto'
-        self.controller_type = 'curvature'  # 'curvature' or 'pid'
+        # self.controller_type = 'curvature'  # 'curvature' or 'pid'
+        self.controller_type = 'pid'
         self.target_speed = TARGET_SPEED
         self.gradual_stop_active = False
         self.emergency_stop_active = False  # NEW: For imminent collision
@@ -100,6 +105,10 @@ class DrivingAgent:
         self.steering_history = deque(maxlen=4)
         self.frame_count = 0
         self.last_lanes_detected = 0  # track lane count for adaptive speed clamping when vision weak
+        
+        # Steering smoothing - EMA filter for lateral error
+        self.lateral_error_ema = None
+        self.lateral_error_alpha = 0.3  # Lower = smoother (0.3 = 30% new, 70% old)
         
         # Manual control state
         self.manual_throttle = 0.0
@@ -124,6 +133,7 @@ class DrivingAgent:
         
         print("✓ Driving Agent initialized")
         print(f"  Mode: {self.mode.upper()}")
+        print(f"  Object Detection ROI: TRIANGULAR (prevents adjacent lane detection)")
         if self.traffic_light_enabled:
             print(f"  Traffic Light Detection: ENABLED")
         else:
@@ -259,7 +269,10 @@ class DrivingAgent:
             all_detections, _ = self.obstacle_detector.detect(image)
             
             if lane_result:
-                # CREATE LANE MASK - defaults: 80% single, 90% dual
+                # CREATE LANE MASK with TRIANGULAR ROI
+                # When only 1 lane detected: Uses fixed-width trapezoid (20-22% of image width)
+                #   that narrows toward vanishing point - prevents detecting adjacent lane objects
+                # When 2 lanes detected: Uses actual lane boundaries (more accurate)
                 self.yolo_lane_filter.create_lane_mask_from_lanes(
                     lane_result['filtered_lanes'],
                     expansion_width=10,
@@ -306,7 +319,9 @@ class DrivingAgent:
         
         all_detections, _ = self.obstacle_detector.detect(image, vehicle_speed_kmh=current_speed)
         
-        # CREATE LANE MASK - defaults: 80% single, 90% dual
+        # CREATE LANE MASK with TRIANGULAR ROI
+        # Single lane: Fixed-width trapezoid prevents adjacent lane false positives
+        # Dual lanes: Uses actual boundaries for accurate filtering
         self.yolo_lane_filter.create_lane_mask_from_lanes(
             lane_result['filtered_lanes'],
             expansion_width=50,
@@ -529,21 +544,29 @@ class DrivingAgent:
                 control.brake = 0.3
             else:
                 control.brake = 0.15
-            # Maintain steering
+            # Maintain steering with smoothed input
             if lateral_error is not None:
+                # Apply EMA smoothing
+                if self.lateral_error_ema is None:
+                    self.lateral_error_ema = lateral_error
+                else:
+                    self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                             (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                smoothed_error = self.lateral_error_ema
+                
                 last_steer = self.steering_history[-1] if self.steering_history else None
                 if self.controller_type == 'curvature':
                     control.steer = self.curv_controller.step(
                         lane_detector=self.lane_detector,
-                        lateral_error_m=lateral_error,
+                        lateral_error_m=smoothed_error,
                         speed_kmh=current_speed,
                         last_out=last_steer
                     )
                 else:
-                    control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                    control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
                 self.steering_history.append(control.steer)
             else:
-                control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+                control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
         
         elif obstacle_action == 'cautious':
             # Cautious mode: gentle deceleration, reduce target speed
@@ -560,21 +583,29 @@ class DrivingAgent:
                 control.throttle = 0.2
                 control.brake = 0.0
             
-            # Maintain steering
+            # Maintain steering with smoothed input
             if lateral_error is not None:
+                # Apply EMA smoothing
+                if self.lateral_error_ema is None:
+                    self.lateral_error_ema = lateral_error
+                else:
+                    self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                             (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                smoothed_error = self.lateral_error_ema
+                
                 last_steer = self.steering_history[-1] if self.steering_history else None
                 if self.controller_type == 'curvature':
                     control.steer = self.curv_controller.step(
                         lane_detector=self.lane_detector,
-                        lateral_error_m=lateral_error,
+                        lateral_error_m=smoothed_error,
                         speed_kmh=current_speed,
                         last_out=last_steer
                     )
                 else:
-                    control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                    control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
                 self.steering_history.append(control.steer)
             else:
-                control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+                control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
         
         else:
             # Normal driving (obstacle_action == 'drive')
@@ -589,15 +620,15 @@ class DrivingAgent:
             # very_sharp: 18 km/h (tight bend safety)
             if kappa is not None and kappa_cls is not None:
                 if kappa_cls == 'straight':
-                    dyn_target = 40.0
+                    dyn_target = 15.0
                 elif kappa_cls == 'gentle':
-                    dyn_target = 35.0
+                    dyn_target = 15.0
                 elif kappa_cls == 'moderate':
-                    dyn_target = 30.0
+                    dyn_target = 15.0
                 elif kappa_cls == 'sharp':
-                    dyn_target = 25.0
+                    dyn_target = 15.0
                 else:  # very_sharp
-                    dyn_target = 20.0
+                    dyn_target = 15.0
             else:
                 dyn_target = 15.0  # unknown curvature fallback
 
@@ -610,18 +641,18 @@ class DrivingAgent:
             self.target_speed = dyn_target
 
             # Speed control toward dynamic target
-            # Speed control bands tuned for smoother approach to target
+            # Smoother speed control bands to reduce jerking
             speed_err = self.target_speed - current_speed
             if speed_err > 8:
-                control.throttle, control.brake = 0.80, 0.0
+                control.throttle, control.brake = 0.5, 0.0
             elif speed_err > 4:
-                control.throttle, control.brake = 0.55, 0.0
-            elif speed_err > 1:
                 control.throttle, control.brake = 0.35, 0.0
+            elif speed_err > 1:
+                control.throttle, control.brake = 0.22, 0.0
             elif speed_err < -5:
-                control.throttle, control.brake = 0.0, 0.5
+                control.throttle, control.brake = 0.0, 0.25
             elif speed_err < -2:
-                control.throttle, control.brake = 0.05, 0.3
+                control.throttle, control.brake = 0.0, 0.12
             else:
                 control.throttle, control.brake = 0.18, 0.0
             
@@ -631,20 +662,31 @@ class DrivingAgent:
             if map_steer is not None:
                 control.steer = map_steer
             else:
+                # Apply EMA smoothing to lateral error to reduce steering jerk
+                if lateral_error is not None:
+                    if self.lateral_error_ema is None:
+                        self.lateral_error_ema = lateral_error
+                    else:
+                        self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                                 (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                    smoothed_error = self.lateral_error_ema
+                else:
+                    smoothed_error = None
+                
                 last_steer = self.steering_history[-1] if self.steering_history else None
                 if self.controller_type == 'curvature':
                     control.steer = self.curv_controller.step(
                         lane_detector=self.lane_detector,
-                        lateral_error_m=lateral_error,
+                        lateral_error_m=smoothed_error,
                         speed_kmh=current_speed,
                         last_out=last_steer
                     )
                 else:
-                    # Fallback to PID if selected
-                    if lateral_error is not None:
-                        control.steer = self.pid_controller.step(lateral_error, last_out=last_steer)
+                    # PID with smoothed lateral error for reduced jerk
+                    if smoothed_error is not None:
+                        control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
                     else:
-                        control.steer = self.steering_history[-1] * 0.9 if self.steering_history else 0.0
+                        control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
             self.steering_history.append(control.steer)
         
         return control, decision
@@ -796,9 +838,9 @@ class DrivingAgent:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
         cv2.putText(vis, f"Speed: {speed:.1f} km/h", (10, 90), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        if hasattr(self, 'last_curvature') and self.last_curvature is not None:
-            cv2.putText(vis, f"Curv: {self.last_curvature:.4f} ({self.last_curvature_class})", (10, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2)
+        # if hasattr(self, 'last_curvature') and self.last_curvature is not None:
+            # cv2.putText(vis, f"Curv: {self.last_curvature:.4f} ({self.last_curvature_class})", (10, 240),
+                        # cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2)
         
         if result['lane_data']:
             lanes_detected = result['lane_data']['lanes_detected']
