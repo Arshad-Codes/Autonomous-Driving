@@ -23,7 +23,7 @@ class TrafficLightDetector:
     Traffic light detector using YOLO model with enhanced stopping behavior
     """
     
-    def __init__(self, model_path: str = "v9 - 64 epochs.pt", 
+    def __init__(self, model_path: str = "traffic_light.pt", 
                  class_names: List[str] = None):
         """
         Initialize traffic light detector

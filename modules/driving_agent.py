@@ -64,7 +64,7 @@ class DrivingAgent:
         
         # Traffic light detector
         self.traffic_light_detector = TrafficLightDetector(
-            model_path="v9 - 64 epochs.pt"
+            model_path="traffic_light.pt"
         )
         self.traffic_light_enabled = self.traffic_light_detector.is_available()
         
